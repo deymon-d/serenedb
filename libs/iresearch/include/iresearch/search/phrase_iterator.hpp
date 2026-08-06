@@ -23,6 +23,7 @@
 #pragma once
 
 #include <memory>
+#include <limits>
 
 #include "basics/empty.hpp"
 #include "disjunction.hpp"
@@ -375,6 +376,8 @@ class FixedPhraseFrequency {
     std::conditional_t<HasIntervals,
                        IntervalPositionStrategy<typename Positions::iterator>,
                        SinglePositionStrategy<typename Positions::iterator>>;
+  using IntervalBoundType = decltype(std::declval<TermPosition>().second.offs_min);
+  using Traits = TermPositionTraits<TermPosition>;
 
   static constexpr bool kHasBoost = false;
   static constexpr bool kHasFreq = HasFreq;
@@ -415,61 +418,159 @@ class FixedPhraseFrequency {
 
   uint32_t NextPositionGeneric() {
     uint32_t phrase_freq = 0;
-    auto& lead = *_pos.front().first;
-    lead.next();
-    auto lead_it = std::begin(_pos);
-    ExecutionStrategy strategy{lead_it, lead};
-    SDB_ASSERT(_pos.size() > 1);
 
-    for (auto end = std::end(_pos); !pos_limits::eof(lead.value());) {
-      strategy.NotifyNextLead(end);
-      bool match = true;
-      for (auto it = lead_it + 1; it != end;) {
-        auto& pos = *it->first;
+    struct Node {
+      using PosType = decltype(_pos.front().first->seek(1));
 
-        const auto term_position = strategy.NextPosition(it);
-        if (!pos_limits::valid(term_position)) {
-          return phrase_freq;
+      int left{-1};
+      int right{-1};
+      int parent{-1};
+      IntervalBoundType min_offset{0};
+      IntervalBoundType max_offset{0};
+      PosType pos{0};
+    };
+
+    std::vector<Node> tree(_pos.size());
+    int root = 0;
+    IntervalBoundType min_offset = 0;
+    IntervalBoundType max_offset = 0;
+    for (int i = 1; i < _pos.size(); ++i) {
+      auto interval = Traits::Interval(_pos[i]);
+      min_offset += interval.offs_min;
+      max_offset += interval.offs_max;
+      auto parent = i - 1;
+      while (parent != -1 && _pos[i].first->DocFreq() < _pos[parent].first->DocFreq()) {
+        parent = tree[parent].parent;
+      }
+      if (parent == -1) {
+        tree[i].left = root;
+        tree[root].parent = i;
+        root = i;
+      } else {
+        if (tree[parent].right != -1) {
+          tree[i].left = tree[parent].right;
+          tree[tree[i].left].parent = i;
         }
-        const auto sought = pos.seek(term_position);
+        tree[i].parent = parent;
+        tree[parent].right = i;
+      }
+      tree[i].min_offset = min_offset;
+      tree[i].max_offset = max_offset;
+    }
 
-        if (pos_limits::eof(sought)) {
-          // exhausted
-          if constexpr (HasFreq) {
-            if (!strategy.NextPermutation(it, end)) {
-              return phrase_freq;
-            }
-
-            if (it == end) {
-              lead.next();
-              match = false;
-            }
-            continue;
-          } else {
-            return phrase_freq;
-          }
-        }
-        match = strategy.AdvanceIterators(
-          strategy.Match(term_position, sought, it->second), sought, end, it);
-
-        if constexpr (HasFreq) {
-          if (it == end && match) {
-            if (!strategy.NextPermutation(it, end)) {
+    auto perm_count = [&]<bool IsLeftChild>(this auto&& self, int cur_node) {
+      Traits::ResetPos(_pos[cur_node]);
+      uint32_t freq = 0;
+      const auto parent = tree[cur_node].parent;
+      auto& cur_term = *_pos[cur_node].first;
+      const auto parent_pos = tree[parent].pos;
+      int neibour = -1;
+      const bool is_leaf = (tree[cur_node].left == -1 && tree[cur_node].right == -1);
+      const bool is_border = is_leaf
+          || (IsLeftChild && tree[cur_node].left == -1 && tree[cur_node].right != -1)
+          || (!IsLeftChild && tree[cur_node].left != -1 && tree[cur_node].right == -1);
+      if (is_border) {
+        int grand_parent =  tree[parent].parent;
+        int cur_parent = parent;
+        while (grand_parent != -1) {
+          if constexpr (IsLeftChild) {
+            if (tree[grand_parent].right == cur_parent) {
               break;
             }
-            ++phrase_freq;
+          } else {
+            if (tree[grand_parent].left == cur_parent) {
+              break;
+            }
+          }
+          cur_parent = grand_parent;
+          grand_parent = tree[cur_parent].parent;
+        }
+        neibour = grand_parent;
+      }
+      const auto min_delta_offset = IsLeftChild 
+          ? tree[parent].min_offset - tree[cur_node].min_offset
+          : tree[cur_node].min_offset - tree[parent].min_offset;
+      const auto max_delta_offset = IsLeftChild 
+          ? tree[parent].max_offset - tree[cur_node].max_offset
+          : tree[cur_node].max_offset - tree[parent].max_offset;
+      auto term_pos = cur_term.seek(IsLeftChild
+        ? (parent_pos > max_delta_offset ? parent_pos - max_delta_offset : 1)
+        : parent_pos + min_delta_offset
+      );
+      while (true) {
+        if (pos_limits::eof(term_pos)) {
+          return freq;
+        }
+        if constexpr (IsLeftChild) {
+          if (parent_pos < term_pos + min_delta_offset) {
+            return freq;
+          }
+        } else {
+          if (term_pos > parent_pos + max_delta_offset) {
+            return freq;
           }
         }
-        if (!match) {
-          break;
+        if (is_border) {
+          if (neibour != -1) {
+            const auto neibour_pos = tree[neibour].pos;
+            if constexpr (IsLeftChild) {
+              const auto delta_pos = term_pos - neibour_pos;
+
+              if (delta_pos < tree[cur_node].min_offset - tree[neibour].min_offset
+                  || delta_pos > tree[cur_node].max_offset - tree[neibour].max_offset) {
+                goto restart;
+              }
+            } else {
+              const auto delta_pos = neibour_pos - term_pos;
+
+              if (delta_pos < tree[neibour].min_offset - tree[cur_node].min_offset
+                  || delta_pos > tree[neibour].max_offset - tree[cur_node].max_offset) {
+                goto restart;
+              }
+            }
+          }
         }
+        {
+          tree[cur_node].pos = term_pos;
+          uint32_t left_freq = 1;
+          uint32_t right_freq = 1;
+          if (tree[cur_node].left != -1) {
+            left_freq = self.template operator()<true>(tree[cur_node].left);
+            if (!left_freq) {
+              goto restart;
+            }
+          }
+          if (tree[cur_node].right != -1) {
+            right_freq = self.template operator()<false>(tree[cur_node].right);
+          }
+          freq += left_freq * right_freq;
+          if constexpr (!HasFreq) {
+            if (freq) {
+              return freq;
+            }
+          }
+        }
+        restart:
+        cur_term.next();
+        term_pos = cur_term.value();
       }
-      if (match) {
-        if constexpr (HasFreq) {
-          ++phrase_freq;
-          lead.next();
-        } else {
-          return 1;
+
+      return freq;
+    };
+
+    SDB_ASSERT(_pos.size() > 1);
+
+    auto& rarest_pos = *_pos[root].first;
+    rarest_pos.next();
+
+    for (; !pos_limits::eof(rarest_pos.value()); rarest_pos.next()) {
+      tree[root].pos = rarest_pos.value();
+      const auto left_res = tree[root].left != -1 ? perm_count.template operator()<true>(tree[root].left) : 1;
+      const auto right_res = tree[root].right != -1 ? perm_count.template operator()<false>(tree[root].right) : 1; 
+      phrase_freq += left_res * right_res;
+      if constexpr (!HasFreq) {
+        if (phrase_freq) {
+          return phrase_freq;
         }
       }
     }
