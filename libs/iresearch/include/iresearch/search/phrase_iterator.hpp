@@ -23,6 +23,7 @@
 #pragma once
 
 #include <memory>
+#include <limits>
 
 #include "basics/empty.hpp"
 #include "disjunction.hpp"
@@ -375,6 +376,8 @@ class FixedPhraseFrequency {
     std::conditional_t<HasIntervals,
                        IntervalPositionStrategy<typename Positions::iterator>,
                        SinglePositionStrategy<typename Positions::iterator>>;
+  using IntervalBoundType = decltype(std::declval<TermPosition>().second.offs_min);
+  using Traits = TermPositionTraits<TermPosition>;
 
   static constexpr bool kHasBoost = false;
   static constexpr bool kHasFreq = HasFreq;
@@ -416,62 +419,118 @@ class FixedPhraseFrequency {
   uint32_t NextPositionGeneric() {
     uint32_t phrase_freq = 0;
     auto& lead = *_pos.front().first;
-    lead.next();
+
+    auto rarest_term_it = _pos.begin();
+    auto second_rarest_term_it = _pos.begin();
+    auto min_term_rate = rarest_term_it->first->DocFreq();
+    auto second_min_term_rate = std::numeric_limits<decltype(min_term_rate)>::max();
+    IntervalBoundType min_offset = 0;
+    IntervalBoundType max_offset = 0;
+    IntervalBoundType second_min_offset = 0;
+    IntervalBoundType second_max_offset = 0;
+    IntervalBoundType min_offset_cand = 0;
+    IntervalBoundType max_offset_cand = 0;
+    for (auto it = rarest_term_it + 1; it != _pos.end(); ++it) {
+      auto cand_term_rate = it->first->DocFreq();
+      min_offset_cand += Traits::Interval(*it).offs_min;
+      max_offset_cand += Traits::Interval(*it).offs_max;
+      if (cand_term_rate < min_term_rate) {
+        second_min_term_rate = min_term_rate;
+        second_rarest_term_it = rarest_term_it;
+        second_min_offset = min_offset;
+        second_max_offset = max_offset;
+        rarest_term_it = it;
+        min_term_rate = cand_term_rate;
+        min_offset = min_offset_cand;
+        max_offset = max_offset_cand;
+      } else if (cand_term_rate < second_min_term_rate) {
+        second_rarest_term_it = it;
+        second_min_term_rate = cand_term_rate;
+        second_min_offset = min_offset_cand;
+        second_max_offset = max_offset_cand;        
+      }
+    }
+    
+    auto& rarest_term = *rarest_term_it->first;
+    auto& second_rarest_term = *second_rarest_term_it->first;
+    second_rarest_term.next();
+    rarest_term.next();
+    auto rarest_pos = rarest_term.value();
+    IntervalBoundType rarest_term_it_offset = rarest_pos + 1;;
+
     auto lead_it = std::begin(_pos);
+    auto end = std::end(_pos);
     ExecutionStrategy strategy{lead_it, lead};
     SDB_ASSERT(_pos.size() > 1);
 
-    for (auto end = std::end(_pos); !pos_limits::eof(lead.value());) {
-      strategy.NotifyNextLead(end);
-      bool match = true;
-      for (auto it = lead_it + 1; it != end;) {
-        auto& pos = *it->first;
-
-        const auto term_position = strategy.NextPosition(it);
-        if (!pos_limits::valid(term_position)) {
-          return phrase_freq;
-        }
-        const auto sought = pos.seek(term_position);
-
-        if (pos_limits::eof(sought)) {
-          // exhausted
-          if constexpr (HasFreq) {
-            if (!strategy.NextPermutation(it, end)) {
-              return phrase_freq;
-            }
-
-            if (it == end) {
-              lead.next();
-              match = false;
-            }
-            continue;
-          } else {
+    while (!pos_limits::eof(rarest_pos)) {
+      lead.seek(rarest_pos > max_offset ? rarest_pos - max_offset : 1);
+      while (!pos_limits::eof(lead.value()) && lead.value() <= rarest_pos - min_offset) {
+        if (second_min_offset) {
+          Traits::ResetPos(*second_rarest_term_it);
+          const auto second_pos = second_rarest_term.seek(lead.value() + second_min_offset);
+          if (pos_limits::eof(second_pos)) {
             return phrase_freq;
           }
-        }
-        match = strategy.AdvanceIterators(
-          strategy.Match(term_position, sought, it->second), sought, end, it);
-
-        if constexpr (HasFreq) {
-          if (it == end && match) {
-            if (!strategy.NextPermutation(it, end)) {
-              break;
-            }
-            ++phrase_freq;
+          if (second_pos > lead.value() + second_max_offset) {
+            lead.next();
+            continue;
           }
         }
-        if (!match) {
-          break;
+        strategy.NotifyNextLead(end);
+        bool match = true;
+        for (auto it = lead_it + 1; it != end;) {
+          auto& pos = *it->first;
+
+          const auto term_position = strategy.NextPosition(it);
+          if (!pos_limits::valid(term_position)) {
+            return phrase_freq;
+          }
+          const auto sought = pos.seek(term_position);
+
+          if (pos_limits::eof(sought)) {
+            // exhausted
+            if constexpr (HasFreq) {
+              if (!strategy.NextPermutation(it, end)) {
+                return phrase_freq;
+              }
+
+              if (it == end) {
+                lead.next();
+                match = false;
+              }
+              continue;
+            } else {
+              return phrase_freq;
+            }
+          }
+          match = strategy.AdvanceIterators(
+            strategy.Match(term_position, sought, it->second), sought, end, it);
+
+          if constexpr (HasFreq) {
+            if (it == end && match) {
+              if (!strategy.NextPermutation(it, end)) {
+                break;
+              }
+              ++phrase_freq;
+            }
+          }
+          if (!match) {
+            break;
+          }
+        }
+        if (match) {
+          if constexpr (HasFreq) {
+            ++phrase_freq;
+            lead.next();
+          } else {
+            return 1;
+          }
         }
       }
-      if (match) {
-        if constexpr (HasFreq) {
-          ++phrase_freq;
-          lead.next();
-        } else {
-          return 1;
-        }
-      }
+
+      rarest_pos = rarest_term.seek(rarest_term_it_offset);
+      rarest_term_it_offset = rarest_pos + 1;
     }
 
     return phrase_freq;
